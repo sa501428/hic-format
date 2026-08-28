@@ -83,7 +83,7 @@ All file positions are absolute `u64` byte offsets from the first byte of the fi
 [position, position + length)
 ```
 
-The addition MUST be checked for overflow and the resulting interval MUST lie within the file. A zero position and zero length mean that an optional structure is absent. No valid present structure has a zero length.
+The addition MUST be checked for overflow and the resulting interval MUST lie within the file. A zero position and zero length mean that an optional structure is absent. A locator pair with only one zero value is invalid. No valid present structure has a zero length.
 
 Genomic coordinates and bin intervals are also zero-based and half-open. For base-pair resolution `R`:
 
@@ -136,10 +136,14 @@ A conforming file MUST satisfy all of the following:
 - chromosome indices and resolution indices refer to header entries;
 - chromosome-pair keys are canonical with `chr1Index <= chr2Index`;
 - matrix and vector directory keys are unique;
+- every logical matrix cell is encoded at most once;
 - page ranges are ordered and non-overlapping within a resolution;
 - logical block numbers are strictly increasing within a page;
 - sparse positions and exception ordinals are strictly increasing;
 - counts never overflow `u64` while decoding or deriving;
+- the exact full-matrix count sum fits `u64`;
+- every chromosome's bin count at every advertised resolution fits `u32`;
+- every computed logical block number fits `u32`;
 - all advertised derived resolutions point directly to a finer materialized resolution in the same unit;
 - all unused flag bits and reserved bytes are zero.
 
@@ -165,6 +169,25 @@ The offsets are authoritative, so a writer MAY choose another order. Pages belon
 
 Seekable writers normally reserve and write the header, emit the remaining structures, then backpatch header offsets and lengths. A streaming producer MUST stage enough metadata to emit a correct final seekable file; V10 does not define an unpatched streaming variant.
 
+Fixed-size record summary:
+
+| Record | Bytes |
+|---|---:|
+| Fixed header prefix | 88 |
+| Footer header | 24 |
+| Footer matrix entry | 24 |
+| Matrix record header | 24 |
+| Matrix resolution descriptor | 76 |
+| Page-index header | 32 |
+| Page-index checkpoint | 32 |
+| Stored page header | 16 |
+| Logical block header | 40 |
+| Vector-index header | 16 |
+| Vector chunk descriptor | 32 |
+| Stored vector chunk header | 16 |
+
+Variable records have explicit lengths or formulas in their defining sections. This summary is informative; the field tables are authoritative.
+
 ### C. Header
 
 #### C.1 Fixed header prefix
@@ -189,6 +212,8 @@ The file starts with this fixed 88-byte prefix:
 
 The three direct vector-index locators preserve inexpensive remote access without first downloading the footer. `headerByteLength` MUST be at least 88 and MUST equal the reader's position immediately after parsing the variable header.
 
+The footer locator is mandatory and both of its fields MUST be nonzero. Each optional vector-index locator MUST be either a valid nonzero pair or the absent pair `(0, 0)`.
+
 #### C.2 Variable header
 
 The following fields immediately follow the fixed prefix, with no alignment padding:
@@ -197,7 +222,7 @@ The following fields immediately follow the fixed prefix, with no alignment padd
 |---|---|---|
 | `genomeId` | `cstr` | Genome or assembly identifier; may be empty |
 | `nAttributes` | `u32` | Number of attribute pairs |
-| `attributeKey`, `attributeValue` | `cstr`, `cstr` | Repeated `nAttributes` times; keys MUST be unique |
+| `attributeKey`, `attributeValue` | `cstr`, `cstr` | Repeated `nAttributes` times in stored order |
 | `nChromosomes` | `u32` | Number of chromosome records |
 | `chromosomeName`, `chromosomeLength` | `cstr`, `u64` | Repeated `nChromosomes` times |
 | `nBpResolutions` | `u32` | Number of BP resolution records |
@@ -208,11 +233,11 @@ The following fields immediately follow the fixed prefix, with no alignment padd
 | `nNormalizationTypes` | `u32` | Number of normalization type strings |
 | `normalizationTypeName` | `cstr` | Repeated `nNormalizationTypes` times |
 
-Chromosome index is the zero-based array index. Names MUST be non-empty and unique. `chromosomeLength` is the number of base pairs and MAY use the full `u64` range, although implementations interoperating with signed-language APIs SHOULD reject values above `2^63 - 1`.
+`nChromosomes` MUST be positive. Chromosome index is the zero-based array index. Names MUST be non-empty and unique, and chromosome lengths MUST be positive. `chromosomeLength` is stored as `u64`; however, the bin count at every advertised BP or FRAG resolution MUST fit `u32`, because block coordinates are `u32`. Implementations interoperating with signed-language coordinate APIs SHOULD also reject chromosome lengths above `2^63 - 1`.
 
-The normalization type ID is the zero-based index into `normalizationTypeName`. Names such as `VC`, `VC_SQRT`, `KR`, `INTER_KR`, `INTER_VC`, `GW_KR`, and `GW_VC` have their established meanings, but the dictionary is extensible. `NONE` denotes the absence of normalization and MUST NOT be entered as a normalization type.
+The normalization type ID is the zero-based index into `normalizationTypeName`. Normalization type names MUST be non-empty and unique. Names such as `VC`, `VC_SQRT`, `KR`, `INTER_KR`, `INTER_VC`, `GW_KR`, and `GW_VC` have their established meanings, but the dictionary is extensible. `NONE` denotes the absence of normalization and MUST NOT be entered as a normalization type.
 
-Attributes are application metadata and do not alter core decoding unless this specification assigns a meaning to a key. Common keys include `statistics`, `graphs`, and `software`. A reader MUST preserve unknown attributes when repacking a file.
+Attributes are an ordered application-metadata list and do not alter core decoding unless this specification assigns a meaning to a key. Duplicate keys are permitted and MUST NOT be collapsed by a repacker. Common keys include `statistics`, `graphs`, and `software`. A reader MUST preserve unknown attributes, order, and duplicates when repacking a file.
 
 #### C.3 Logical-resolution record
 
@@ -239,7 +264,7 @@ When at least one FRAG resolution is advertised, one site list follows for every
 | `nSites` | `u32` | Number of restriction cut sites |
 | `sitePosition` | `u64` | Repeated `nSites` times |
 
-Site positions MUST be strictly increasing and less than the chromosome length. They are zero-based cut coordinates. Chromosome coordinate `p` belongs to fragment:
+Site positions MUST be strictly increasing, greater than zero, and less than the chromosome length. They are zero-based cut coordinates. Chromosome coordinate `p` belongs to fragment:
 
 ```text
 fragmentIndex = number of sitePosition values <= p
@@ -315,13 +340,15 @@ Every logical resolution, including a derived resolution, has one fixed 76-byte 
 | `pageIndexPosition` | `u64` | Page index position, or zero for a derived resolution |
 | `pageIndexLength` | `u64` | Page index length, or zero for a derived resolution |
 | `pageCount` | `u32` | Number of stored pages; zero for a derived resolution |
-| `reserved1` | `u32` | Zero |
+| `logicalBlockCount` | `u32` | Total physically stored non-empty blocks; zero for a derived resolution |
 
-For `COUNT_UINT`, `sumCountsOrScores` is the exact unsigned sum over the stored canonical matrix cells. For `SCORE_FLOAT32`, it is an `f64` summary. `occupiedCellCount` is an integer, not a float. Zero-valued count cells are absent; a present score may have any `f32` bit pattern, including `+0`, `-0`, or NaN.
+For `COUNT_UINT`, `sumCountsOrScores` is the exact unsigned sum over the stored canonical matrix cells. For `SCORE_FLOAT32`, scores are visited by increasing global bin row and then bin column, converted exactly to binary64, and added using round-to-nearest, ties-to-even; the resulting binary64 bits are stored, including an IEEE result such as NaN or infinity. `occupiedCellCount` is an integer, not a float. Zero-valued count cells are absent; a present score may have any `f32` bit pattern, including `+0`, `-0`, or NaN.
 
 `stdDev` and `percent95` are descriptive metadata and do not affect decoding. Writers that do not compute either field MUST store the canonical quiet-NaN bits `0x7fc00000`, not zero.
 
-A materialized descriptor MUST address a page index, except that an all-empty matrix may use `(pageIndexPosition, pageIndexLength, pageCount) = (0, 0, 0)`. A derived descriptor MUST set all three fields to zero. Its `valueType`, grid metadata, statistics, and auxiliary vectors describe the target resolution, not the source.
+A materialized descriptor MUST address a page index, except that an all-empty matrix may use `(pageIndexPosition, pageIndexLength, pageCount, logicalBlockCount) = (0, 0, 0, 0)`. For a non-empty materialized resolution, `logicalBlockCount` MUST equal the sum of the `blockCount` fields in all its pages. A derived descriptor MUST set all four storage fields to zero. Its `valueType`, grid metadata, statistics, and auxiliary vectors describe the target resolution, not the source.
+
+Within one matrix record, a derived descriptor and its declared source descriptor MUST have the same `valueType`. A missing chromosome-pair footer entry denotes an all-zero `COUNT_UINT` matrix. Therefore a file using `SCORE_FLOAT32` for any omitted chromosome pair MUST instead emit an explicit matrix record for that pair, even when it has no occupied cells.
 
 ### F. Logical Block Geometry
 
@@ -345,14 +372,18 @@ blockNumber = blockRow * blockColumnCount + blockColumn
 
 #### F.3 Rotated cis grid
 
-`GridType.ROTATED_CIS` is valid only when `chr1Index == chr2Index`. It preserves the V9 diagonal/anti-diagonal organization. First canonicalize `binRow >= binColumn`, then compute using real arithmetic followed by `floor`:
+`GridType.ROTATED_CIS` is valid only when `chr1Index == chr2Index`. It preserves the V9 diagonal/anti-diagonal organization. First canonicalize `binRow >= binColumn`. Let `B = blockBinCount` and `d = binRow - binColumn`. Then:
 
 ```text
-alongDiagonal     = floor((binColumn + binRow) / (2 * blockBinCount))
-alongAntiDiagonal = floor(log2(1 + (binRow - binColumn) /
-                                      (sqrt(2) * blockBinCount)))
+alongDiagonal = floor((binColumn + binRow) / (2 * B))
+
+alongAntiDiagonal = largest integer a >= 0 such that
+    d^2 >= 2 * B^2 * (2^a - 1)^2
+
 blockNumber       = alongAntiDiagonal * blockColumnCount + alongDiagonal
 ```
+
+The integer inequality is the normative definition and is exactly equivalent to `floor(log2(1 + d / (sqrt(2) * B)))`. It avoids platform-dependent behavior near a floating-point boundary. Implementations MUST use checked sufficiently wide integer arithmetic (or an algebraically equivalent exact comparison) and MUST verify that the final block number fits `u32`.
 
 All cells assigned the same number form one logical block, even though the region is rotated in genomic coordinates. A stored block therefore carries explicit genomic bin offsets, width, and height; readers MUST use those fields when reconstructing cells.
 
@@ -415,9 +446,11 @@ For every page:
 lastBlock = firstBlock + blockSpanMinus1
 ```
 
-The block ranges MUST be ordered and non-overlapping. A range may contain logical block numbers absent from the page; those blocks are empty. `storedByteLength` includes the 16-byte page header plus its Zstandard frame. `uncompressedBytes` is the size of the decompressed page payload and MUST fit `u32`.
+The block ranges MUST be ordered and non-overlapping. For each page, `firstBlock` and `lastBlock` MUST equal the smallest and largest block numbers in its internal directory. Numbers between them may be absent and are empty. `storedByteLength` includes the 16-byte page header plus its Zstandard frame and MUST be greater than 16. `uncompressedBytes` is the size of the decompressed page payload and MUST fit `u32`.
 
-Pages for the resolution MUST be contiguous in ordinal order, with no padding or unrelated data between them. A reader locates a block by binary-searching checkpoint `firstBlockNumber` values, decoding at most one checkpoint group, and testing the candidate page range. It then confirms presence using the page's internal block directory.
+Pages for the resolution MUST be contiguous in ordinal order, with no padding or unrelated data between them. Consequently, every checkpoint after the first MUST have `firstPagePosition` equal to the previous group's final page position plus that page's `storedByteLength`. A reader locates a block by binary-searching checkpoint `firstBlockNumber` values, decoding at most one checkpoint group, and testing the candidate page range. It then confirms presence using the page's internal block directory.
+
+`descriptorOffset` values MUST be strictly increasing, the first MUST be zero, each group MUST end exactly at the next group's offset, and the final group MUST end exactly at `descriptorByteLength`. Trailing or unreferenced descriptor bytes are invalid.
 
 ### H. Stored Matrix Page
 
@@ -433,7 +466,7 @@ Each page is independently decompressible and starts with a 16-byte uncompressed
 | `blockCount` | `u32` | Number of non-empty logical blocks |
 | `compressedPayload` | bytes | One complete Zstandard frame |
 
-The Zstandard frame consumes exactly `storedByteLength - 16` bytes and MUST decompress to exactly `uncompressedBytes`. Preset dictionaries are forbidden. The frame checksum flag MAY be used. Compression level is a writer choice and is not stored because it does not affect decoding.
+`blockCount` MUST be positive. The Zstandard frame consumes exactly `storedByteLength - 16` bytes and MUST decompress to exactly `uncompressedBytes`. It MUST be one ordinary Zstandard data frame as defined by [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html), not a skippable frame or a concatenation of frames. Preset dictionaries are forbidden. The frame checksum flag MAY be used and MUST be verified by readers when present. Compression level is a writer choice and is not stored because it does not affect decoding.
 
 The decompressed payload is:
 
@@ -497,7 +530,7 @@ For `BITMAP`, the position stream is exactly `ceil(W * H / 8)` bytes. Bit `p` is
 
 For a dense `COUNT_UINT` block, the position stream is empty, `EXPLICIT_PRESENCE` is zero, and every one of the `W * H` cells has a value slot. A zero count means absent; `N` MUST equal the number of nonzero decoded values.
 
-For a dense `SCORE_FLOAT32` block, `EXPLICIT_PRESENCE` MUST be one and the position stream is the same bitmap defined above. Every cell still has a value slot, including absent cells, so arbitrary `f32` values—including NaN—remain distinguishable from absence. Only values whose presence bit is one are returned; `N` is the bitmap population count.
+For a dense `SCORE_FLOAT32` block, `EXPLICIT_PRESENCE` MUST be one and the position stream is the same bitmap defined above. Every cell still has a value slot. A writer MUST store positive-zero bits (`0x00000000`) in every absent slot; a reader MUST validate this but return only slots whose presence bit is one. Present values may use any `f32` bit pattern, including zero or NaN, and therefore remain distinguishable from absence. `N` is the bitmap population count.
 
 Dense blocks MUST use `ValueMode.DIRECT`.
 
@@ -522,7 +555,7 @@ exceptionOrdinalDeltas       exceptionCount × uleb128
 exceptionValues              exceptionCount × scalar
 ```
 
-The first exception ordinal is absolute. Each later ordinal is the previous ordinal plus a strictly positive delta. Every ordinal is less than `S`. An exception value MUST differ from the default (`u64` comparison for counts, bitwise comparison for `f32`). This mode is forbidden for `DENSE`.
+`exceptionCount` MUST be greater than zero and less than `S`. The first exception ordinal is absolute. Each later ordinal is the previous ordinal plus a strictly positive delta. Every ordinal is less than `S`. An exception value MUST differ from the default (`u64` comparison for counts, bitwise comparison for `f32`). This mode is forbidden for `DENSE`.
 
 #### I.8 `DIRECT`
 
@@ -551,7 +584,7 @@ Normalization, raw expected, and normalized expected arrays are `f32` arrays div
 | `storedByteLength` | `u32` | 16-byte header plus Zstandard frame |
 | `uncompressedByteLength` | `u32` | Must equal `4 * valueCount` |
 
-Descriptors MUST cover `[0, valueCountOfVector)` contiguously with no overlaps or gaps. A nominal chunk size of 65,536 values is recommended; the last chunk may be shorter.
+Descriptors MUST cover `[0, valueCountOfVector)` contiguously with no overlaps or gaps. Each descriptor's `valueCount` MUST be no greater than `floor(0xFFFFFFFF / 4)`, and `storedByteLength` MUST be greater than 16. For every vector entry, a positive vector length requires positive `nominalChunkValueCount` and `chunkCount`; a zero vector length requires `chunkCount = 0`. A nominal chunk size of 65,536 values is recommended; the last chunk may be shorter.
 
 #### J.2 Stored vector chunk
 
@@ -567,7 +600,7 @@ At `filePosition` is:
 | `valueCount` | `u32` | Must match the descriptor |
 | `compressedPayload` | bytes | One complete Zstandard frame |
 
-The frame MUST decompress to exactly `4 * valueCount` transformed bytes. Preset dictionaries are forbidden.
+The payload MUST be one ordinary Zstandard data frame, not a skippable frame or a concatenation of frames. It MUST decompress to exactly `4 * valueCount` transformed bytes. Preset dictionaries are forbidden, and a frame checksum MUST be verified when present.
 
 Transform definitions operate on the original `u32` words `b[i]`, where each word is the exact bit pattern of an `f32` value:
 
@@ -591,6 +624,10 @@ All three indexes begin with:
 
 Every entry starts with `entryByteLength u32`, which includes that length field and permits a reader to skip an entry after validating it remains within the index interval. No padding occurs between entries. Keys MUST be unique and entries MUST be lexicographically sorted by the keys specified below.
 
+For each index, `16 + sum(entryByteLength)` MUST equal the index length recorded in the header. Trailing bytes are invalid.
+
+Index presence is the capability advertisement: an `NVI0` entry advertises that normalization for one chromosome and resolution; an expected capability is advertised only by the matching `EVI0` or `NEVI` entry. A reader MUST NOT infer missing capabilities from another resolution or normalization type.
+
 #### J.4 Normalization-vector index (`NVI0`)
 
 The key is `(normalizationTypeId, chrIndex, unit, resolutionIndex)`. Each entry is:
@@ -609,7 +646,7 @@ The key is `(normalizationTypeId, chrIndex, unit, resolutionIndex)`. Each entry 
 | `chunkCount` | `u32` | Number of descriptors |
 | chunks | 32 bytes each | Shared chunk descriptors |
 
-`vectorValueCount` MUST equal the chromosome's `nBins` at that resolution. Each advertised normalization capability, including one at a derived resolution, requires its own target-resolution entry.
+`vectorValueCount` MUST equal the chromosome's `nBins` at that resolution. If it is positive, `nominalChunkValueCount` and `chunkCount` MUST be positive; if it is zero, `chunkCount` MUST be zero. Each advertised normalization capability, including one at a derived resolution, requires its own target-resolution entry.
 
 The entry length is exactly `40 + 32 * chunkCount` bytes.
 
@@ -632,13 +669,13 @@ The key is `(unit, resolutionIndex)`. Expected array index `d` is genomic bin di
 | scale factors | 8 bytes each | `(chrIndex u32, scaleFactor f32)` |
 | chunks | 32 bytes each | Shared chunk descriptors |
 
-Scale factors MUST be sorted by chromosome index and unique. A missing factor means 1.0. Raw expected vectors ordinarily apply only to cis matrices.
+`vectorValueCount` MUST equal the maximum chromosome `nBins` for this unit and resolution, covering every possible cis distance from zero through `nBins - 1`. Scale factors MUST be sorted by chromosome index and unique. A missing factor means 1.0. Raw expected vectors apply only to cis matrices.
 
 The entry length is exactly `40 + 8 * scaleFactorCount + 32 * chunkCount` bytes.
 
 #### J.6 Normalized expected-value index (`NEVI`)
 
-The key is `(normalizationTypeId, unit, resolutionIndex)`. Its entry is identical to an `EVI0` entry except that `normalizationTypeId u32` appears immediately after `entryByteLength`. The expected array and scale factors are those of the named target-resolution normalization.
+The key is `(normalizationTypeId, unit, resolutionIndex)`. Its entry is identical to an `EVI0` entry except that `normalizationTypeId u32` appears immediately after `entryByteLength`. The expected array and scale factors are those of the named target-resolution normalization, and `vectorValueCount` has the same full-distance requirement as `EVI0`.
 
 The entry length is exactly `44 + 8 * scaleFactorCount + 32 * chunkCount` bytes.
 
@@ -675,7 +712,9 @@ targetY = floor(y / factor)
 target[targetX, targetY] += value
 ```
 
-Count accumulation uses checked `u64` arithmetic and overflow is a format or query error. For `SCORE_FLOAT32`, derivation is permitted only when `aggregation = SUM`; values are visited in increasing source row and then source column, accumulated in IEEE 754 binary64, and rounded once to binary32 for the target cell. A repacker MUST materialize the target instead if this rule does not reproduce the target matrix being preserved.
+Equivalently, target bin `t` covers source-bin interval `[t * factor, min((t + 1) * factor, sourceNBins))`. Readers MUST use this clipped half-open interval at chromosome ends.
+
+Count accumulation uses checked `u64` arithmetic and overflow is a format or query error. For `SCORE_FLOAT32`, derivation is permitted only when `aggregation = SUM` and every contributing source score is finite. Values are visited in increasing source row and then source column, accumulated in IEEE 754 binary64 using round-to-nearest, ties-to-even, and rounded once with the same mode to binary32 for the target cell. A writer MUST materialize a score target if a source value is non-finite, the binary64 accumulation overflows, or this rule does not reproduce a target matrix being preserved.
 
 Aggregation occurs before normalization or expected-value division. Target-resolution vectors are then applied as specified above. Source vectors MUST NOT be aggregated or reused.
 
@@ -747,12 +786,14 @@ V10 is a new wire format selected by `version = 10`; a V9 reader cannot parse a 
 | `occupiedCellCount` | Exact `u64` |
 | `stdDev`, `percent95` | Explicit `f32`; unavailable values are NaN |
 | `blockSize`, `blockColumnCount` | `blockBinCount`, `blockColumnCount`, and `gridType` |
-| per-block position/size index | Checkpointed page index plus each page's block directory |
+| `blockCount` and per-block position/size index | Resolution `logicalBlockCount`, checkpointed page index, and each page's block directory |
 | `nRecords` | Block `occupiedCellCount` |
 | `binColumnOffset`, `binRowOffset` | Fixed block header offsets |
 | short/int position flags | Canonical `uleb128` position streams |
 | short/float contact flag | Explicit `COUNT_UINT` or `SCORE_FLOAT32` |
 | list-of-rows/dense selector | `SPARSE_DELTA`, `BITMAP`, or `DENSE` |
+| `rowCount`, `rowNumber`, `recordCount`, `binColumn` | Flat sorted local positions plus `occupiedCellCount` |
+| dense width `w` | Explicit `blockWidth` and `blockHeight` |
 | `allCountsOne` | `ALL_DEFAULT` with count value 1 |
 | delta-column flag | Flat row-major position deltas |
 | `-32768` or NaN absence sentinel | Zero count semantics or an explicit presence bitmap |
@@ -763,6 +804,8 @@ V10 is a new wire format selected by `version = 10`; a V9 reader cannot parse a 
 | normalization-vector index and arrays | `NVI0` entries plus exact chunked `f32` storage |
 
 V9 files already store chromosome lengths and many offsets as 64-bit values and V9 expected/normalization values as `f32`; a repacker MUST preserve those values exactly. Older source formats that contain `f64` vectors require an explicit, separately documented conversion policy and cannot claim bitwise lossless conversion to V10 `f32`.
+
+Because some V9 writers emitted placeholder or low-precision matrix statistics, a repacker MUST compute the exact V10 `sumCountsOrScores` and `occupiedCellCount` from decoded logical cells. It MUST recompute `stdDev` and `percent95` under the V10 definitions or write the required canonical NaN; it MUST NOT reinterpret a legacy placeholder zero as a measured statistic.
 
 ---
 
@@ -779,7 +822,7 @@ Every advertised resolution is one of:
 - `MATERIALIZED`: contact matrix blocks are physically stored.
 - `DERIVED`: raw matrix data is reconstructed by exact summation from a finer materialized resolution.
 
-Derived resolutions remain first-class resolutions from the reader's perspective. They retain their own:
+Derived resolutions remain first-class resolutions from the reader's perspective. For every normalization or expected-value capability the file advertises at that resolution, they retain their own target-resolution:
 
 - bin size;
 - expected-value vectors;
@@ -951,11 +994,11 @@ aggregation = SUM | NONE
 
 Ordinary raw contact-count matrices use `SUM`.
 
-Arbitrary score matrices MUST NOT be implicitly aggregated unless the writer explicitly declares their aggregation semantics to be `SUM`.
+Score matrices MUST NOT be implicitly aggregated unless the writer explicitly declares their aggregation semantics to be `SUM` and satisfies the finite-value and deterministic-arithmetic requirements in Section K.
 
 #### 1.6 Source-resolution rule
 
-A derived resolution SHOULD point directly to a materialized source resolution.
+A derived resolution MUST point directly to a materialized source resolution.
 
 For example:
 
@@ -1044,7 +1087,7 @@ V10 does not require replacing the existing rotated cis geometry solely for comp
 
 ### 3. Zstandard Compression
 
-All matrix pages and compressed vector chunks use **Zstandard** rather than ZLib.
+All matrix pages and compressed vector chunks use **Zstandard** rather than ZLib. Section H fixes the interoperable frame requirements and uses the framing defined by [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html).
 
 Each page is independently decompressible.
 
@@ -1207,7 +1250,7 @@ For count matrices:
 positive integer = observed count
 ```
 
-For generic scored matrices where absence must be distinguishable from a numerical zero or NaN value, the dense encoding MUST retain an explicit presence representation when required.
+For scored matrices, the dense encoding always uses the explicit presence bitmap defined in Section I.4, so absence remains distinguishable from a numerical zero or NaN value.
 
 The writer compares applicable representations and chooses the smallest.
 
@@ -1226,7 +1269,7 @@ SCORE_FLOAT32
 
 Raw contact counts MUST NOT be converted to floating-point merely because they exceed the range of a signed 16-bit integer.
 
-`COUNT_UINT` is encoded as an unsigned variable-length integer with support for at least 64-bit count values.
+`COUNT_UINT` is encoded as a canonical unsigned variable-length integer over the full `u64` range.
 
 This gives V10:
 
@@ -1245,11 +1288,11 @@ Fine-resolution contact maps frequently contain blocks in which nearly every occ
 
 V10 therefore treats values independently from positions.
 
-Each block selects a value mode.
+Each sparse or bitmap block selects a value mode. Dense blocks use `DIRECT`, as required by Section I.4.
 
 #### 9.1 `ALL_DEFAULT`
 
-If every occupied cell has the same value:
+For a sparse or bitmap block, if every occupied cell has the same value:
 
 ```text
 defaultValue
@@ -1269,7 +1312,7 @@ with zero bytes of value payload per occupied contact.
 
 #### 9.2 `DEFAULT_EXCEPTIONS`
 
-If most cells have the default value:
+For a sparse or bitmap block, if most occupied cells have the default value:
 
 ```text
 defaultValue
@@ -1308,7 +1351,7 @@ The coordinate of the exceptional record is not duplicated.
 
 #### 9.3 `DIRECT`
 
-When the distribution is not dominated by one value, one value is stored per occupied record.
+When the distribution is not dominated by one value, one value is stored per value slot. A sparse or bitmap value slot is an occupied record; a dense value slot is every cell in its `W × H` rectangle.
 
 For count matrices these values are unsigned variable-length integers.
 
@@ -1374,15 +1417,15 @@ rather than storing a complete 64-bit absolute file offset for every page.
 
 #### 11.2 Delta coding
 
-Monotonically increasing quantities SHOULD use unsigned deltas:
+The exact page index uses unsigned encodings as follows:
 
 ```text
-page/block identifiers
-file positions
-page lengths where beneficial
+logical block identifiers  -> positive deltas
+page file positions        -> checkpoint absolute position + cumulative stored lengths
+page stored lengths        -> canonical uleb128 values
 ```
 
-These deltas are variable-length encoded.
+Section G defines the complete descriptor grammar; writers MUST NOT substitute a different delta scheme.
 
 #### 11.3 Checkpoints
 
@@ -1404,15 +1447,15 @@ This keeps the index both compact and random-access friendly.
 
 #### 11.4 Numeric matrix keys
 
-Chromosome-pair matrix keys SHOULD use chromosome indices directly rather than constructing textual keys such as chromosome-index strings.
+Chromosome-pair matrix keys MUST use chromosome indices directly rather than constructing textual keys such as chromosome-index strings.
 
-Repeated strings such as units and normalization types SHOULD similarly use compact enum/dictionary identifiers in V10 metadata.
+Units MUST use the `Unit` enum and normalization types MUST use identifiers into the header dictionary.
 
 ---
 
 ### 12. Lossless Compression of Normalization Vectors
 
-Normalization vectors remain fully materialized for every supported logical resolution.
+Normalization vectors remain fully materialized for every logical resolution at which the corresponding normalization capability is advertised.
 
 They are no longer stored as one large raw float array.
 
@@ -1523,7 +1566,7 @@ Only those pages are fetched and decompressed.
 
 ##### Step 4 — reconstruct source contacts
 
-Sparse, bitmap, or dense blocks are decoded into their raw integer contacts.
+Sparse, bitmap, or dense blocks are decoded into their raw contacts or scores with the declared `valueType`.
 
 ##### Step 5 — aggregate
 
@@ -1610,12 +1653,23 @@ Each logical resolution carries the following core metadata. Section E.2 defines
 
 ```text
 unit
-binSize
 storageMode
-sourceResolutionIndex
 aggregation
-sumCounts
+valueType
+resolutionIndex
+binSize
+sourceResolutionIndex
+gridType
+sumCountsOrScores
 occupiedCellCount
+stdDev
+percent95
+blockBinCount
+blockColumnCount
+pageIndexPosition
+pageIndexLength
+pageCount
+logicalBlockCount
 ```
 
 For example:
@@ -1649,11 +1703,13 @@ HEADER
     magic
     version = 10
     genome
+    attributes
     chromosomes
     logical resolutions
-    attributes
+    fragment sites
+    normalization type dictionary
 
-MATRIX DIRECTORY
+MATRIX METADATA RECORDS
     chromosome pair
         resolution descriptors
 
@@ -1664,16 +1720,16 @@ MATERIALIZED MATRIX DATA
     compressed matrix pages
     ...
 
-EXPECTED-VALUE INDEX
-EXPECTED-VALUE CHUNKS
-
-NORMALIZED-EXPECTED INDEX
-NORMALIZED-EXPECTED CHUNKS
-
-NORMALIZATION-VECTOR INDEX
 NORMALIZATION-VECTOR CHUNKS
+NORMALIZATION-VECTOR INDEX
 
-MASTER INDEX
+EXPECTED-VALUE CHUNKS
+EXPECTED-VALUE INDEX
+
+NORMALIZED-EXPECTED CHUNKS
+NORMALIZED-EXPECTED INDEX
+
+FOOTER / MATRIX MASTER INDEX
 ```
 
 Part I defines the exact byte ordering. The conceptual lookup path is:
@@ -1911,7 +1967,7 @@ The recommended V10 implementation is therefore:
 500 kb
 ```
 
-All advertised resolutions retain their own normalization and expected-value data.
+Every advertised normalization or expected-value capability uses its own target-resolution data, including at derived matrix resolutions.
 
 ##### Matrix compression
 
