@@ -23,7 +23,7 @@ The central design principle is:
 
 The major V10 changes are:
 
-1. Store only selected matrix-resolution anchors and derive redundant 2×/5× resolutions from raw counts.
+1. Store only selected matrix-resolution anchors; the 20, 50, 200, 500, and 2,000 bp matrices are always derived from raw anchor counts.
 2. Store normalization and expected-value vectors for every advertised logical resolution, including derived resolutions.
 3. Replace ZLib with Zstandard.
 4. Compress neighboring logical blocks together into bounded random-access pages.
@@ -145,6 +145,9 @@ A conforming file MUST satisfy all of the following:
 - every chromosome's bin count at every advertised resolution fits `u32`;
 - every computed logical block number fits `u32`;
 - all advertised derived resolutions point directly to a finer materialized resolution in the same unit;
+- advertised BP resolutions 20, 50, 200, 500, and 2,000 use the mandatory sources defined in Section C.3;
+- an advertised 500,000 bp resolution is materialized;
+- cis matrix descriptors use `ROTATED_CIS` and trans descriptors use `RECTANGULAR`;
 - all unused flag bits and reserved bytes are zero.
 
 ### B. Top-Level File Organization
@@ -253,6 +256,19 @@ Each BP and FRAG resolution list contains fixed 12-byte records:
 
 Resolution lists MUST be strictly increasing by `binSize`. A materialized record MUST use `sourceResolutionIndex = 0xFFFFFFFF`. A derived record MUST use `aggregation = SUM`, and its source MUST be materialized, finer, in the same list, and divide the target bin size exactly. Chained derivation is forbidden.
 
+The following BP storage policy is mandatory whenever the target resolution is advertised:
+
+| Target BP resolution | Required storage | Required source |
+|---:|---|---:|
+| 20 | `DERIVED` | 10 |
+| 50 | `DERIVED` | 10 |
+| 200 | `DERIVED` | 100 |
+| 500 | `DERIVED` | 100 |
+| 2,000 | `DERIVED` | 1,000 |
+| 500,000 | `MATERIALIZED` | — |
+
+Advertising one of the five mandatory derived targets therefore also requires advertising its stated materialized source. A writer MUST NOT materialize those targets or select another source. A writer MUST NOT derive 500,000 bp. These rules apply to ordinary production and V9 conversion; a conversion that cannot reproduce a mandatory target exactly from its required source MUST fail rather than emit a nonconforming V10 file.
+
 The `(unit, resolutionIndex)` pair is the canonical resolution identifier. `binSize` is duplicated in later records for validation; all copies MUST match the header.
 
 #### C.4 Fragment-site lists and FRAG coordinates
@@ -348,6 +364,8 @@ For `COUNT_UINT`, `sumCountsOrScores` is the exact unsigned sum over the stored 
 
 A materialized descriptor MUST address a page index, except that an all-empty matrix may use `(pageIndexPosition, pageIndexLength, pageCount, logicalBlockCount) = (0, 0, 0, 0)`. For a non-empty materialized resolution, `logicalBlockCount` MUST equal the sum of the `blockCount` fields in all its pages. A derived descriptor MUST set all four storage fields to zero. Its `valueType`, grid metadata, statistics, and auxiliary vectors describe the target resolution, not the source.
 
+Every descriptor in a cis matrix record, including a derived or empty descriptor, MUST use `ROTATED_CIS`. Every descriptor in a trans matrix record MUST use `RECTANGULAR`. This invariant lets readers reject geometry ambiguity before fetching pages.
+
 Within one matrix record, a derived descriptor and its declared source descriptor MUST have the same `valueType`. A missing chromosome-pair footer entry denotes an all-zero `COUNT_UINT` matrix. Therefore a file using `SCORE_FLOAT32` for any omitted chromosome pair MUST instead emit an explicit matrix record for that pair, even when it has no occupied cells.
 
 ### F. Logical Block Geometry
@@ -358,9 +376,9 @@ The matrix key always uses `chr1Index <= chr2Index`. In canonical orientation, `
 
 For cis matrices, writers store only cells satisfying `binRow >= binColumn`. The upper triangle is reconstructed by transposition. A diagonal cell is emitted once. Counts and statistics refer to this canonical stored triangle, not to a duplicated symmetric square.
 
-#### F.2 Rectangular grid
+#### F.2 Rectangular trans grid
 
-For `GridType.RECTANGULAR`, with `B = blockBinCount`:
+`GridType.RECTANGULAR` is required when `chr1Index != chr2Index` and forbidden for cis matrices. With `B = blockBinCount`:
 
 ```text
 blockColumn = floor(binColumn / B)
@@ -368,11 +386,11 @@ blockRow    = floor(binRow / B)
 blockNumber = blockRow * blockColumnCount + blockColumn
 ```
 
-`blockColumnCount` MUST equal `ceil(nBins(chr1) / B)`. The number of possible block rows is `ceil(nBins(chr2) / B)`. Cis writers omit upper-triangular blocks that cannot contain a canonical cell.
+`blockColumnCount` MUST equal `ceil(nBins(chr1) / B)`. The number of possible block rows is `ceil(nBins(chr2) / B)`.
 
 #### F.3 Rotated cis grid
 
-`GridType.ROTATED_CIS` is valid only when `chr1Index == chr2Index`. It preserves the V9 diagonal/anti-diagonal organization. First canonicalize `binRow >= binColumn`. Let `B = blockBinCount` and `d = binRow - binColumn`. Then:
+`GridType.ROTATED_CIS` is required when `chr1Index == chr2Index` and forbidden for trans matrices. It preserves the V9 diagonal/anti-diagonal organization. First canonicalize `binRow >= binColumn`. Let `B = blockBinCount` and `d = binRow - binColumn`. Then:
 
 ```text
 alongDiagonal = floor((binColumn + binRow) / (2 * B))
@@ -385,9 +403,27 @@ blockNumber       = alongAntiDiagonal * blockColumnCount + alongDiagonal
 
 The integer inequality is the normative definition and is exactly equivalent to `floor(log2(1 + d / (sqrt(2) * B)))`. It avoids platform-dependent behavior near a floating-point boundary. Implementations MUST use checked sufficiently wide integer arithmetic (or an algebraically equivalent exact comparison) and MUST verify that the final block number fits `u32`.
 
+For a rotated grid, `blockColumnCount` MUST equal `ceil(nBins(chr1) / B)` just as it does along the primary axis of a rectangular grid. Multiplication by this value separates distance bands without collisions.
+
 All cells assigned the same number form one logical block, even though the region is rotated in genomic coordinates. A stored block therefore carries explicit genomic bin offsets, width, and height; readers MUST use those fields when reconstructing cells.
 
 For a cis query rectangle, a reader MAY reproduce the V9 permissive block-candidate calculation, but it MUST filter decoded cells against the requested bin intervals. An implementation may instead enumerate the query's canonical bins or maintain an equivalent inverse index. Query optimization MUST NOT change cell membership.
+
+#### F.4 Standard adaptive block scale
+
+V10 restores the established V9 adaptive block-sizing policy so ultra-fine matrices do not fragment into hundreds of millions of nearly empty logical blocks. For an ordinary BP matrix, let `N = max(nBins(chr1), nBins(chr2))`, `R = binSize`, `K = 1000`, and let `C = 500` for cis or `C = 5000` for trans. Compute:
+
+```text
+if R < C:
+    targetColumns = floor(N * R / (K * C)) + 1
+else:
+    targetColumns = floor(N / K) + 1
+
+adaptiveB = floor(N / targetColumns) + 1
+blockBinCount = max(requestedMinimumBlockBinCount, adaptiveB)
+```
+
+All products MUST use checked sufficiently wide arithmetic. A writer MUST further increase `blockBinCount` if needed to keep every possible block number in `u32`. The standard requested minimum is 256 bins. A writer option may increase that minimum, but MUST NOT reduce the adaptive minimum. This policy deliberately makes blocks much larger as BP resolution becomes finer while retaining bounded logical grids and V9-compatible cis distance bands.
 
 ### G. Resolution Page Index
 
@@ -833,9 +869,9 @@ Derived resolutions remain first-class resolutions from the reader's perspective
 
 Only the redundant contact matrix blocks are omitted.
 
-#### 1.2 Recommended V10 resolution set
+#### 1.2 Required high-resolution pyramid and standard resolution set
 
-For a file extending from 10 bp through 2.5 Mb, the recommended standard layout is:
+For a file extending from 10 bp through 2.5 Mb, the standard layout is:
 
 | Resolution | Matrix storage | Source |
 |---:|---|---:|
@@ -853,11 +889,11 @@ For a file extending from 10 bp through 2.5 Mb, the recommended standard layout 
 | 50 kb | **Materialized** | — |
 | 100 kb | **Materialized** | — |
 | 250 kb | **Materialized** | — |
-| 500 kb | Derived | 100 kb |
+| 500 kb | **Materialized** | — |
 | 1 Mb | **Materialized** | — |
 | 2.5 Mb | **Materialized** | — |
 
-The high-resolution virtual levels are concentrated where duplicated matrix storage is expensive:
+The five high-resolution virtual levels below are mandatory whenever advertised because duplicated matrix storage is most expensive there:
 
 ```text
 10 bp
@@ -886,7 +922,7 @@ At resolutions finer than 1 kb, the 5× resolutions remain derived:
 
 They are not materialized simply because they are 5× levels.
 
-The established coarse-resolution hierarchy remains deliberately conservative:
+The established coarse-resolution hierarchy remains deliberately conservative and fully materialized:
 
 ```text
 5 kb       MATERIALIZED
@@ -895,16 +931,16 @@ The established coarse-resolution hierarchy remains deliberately conservative:
 50 kb      MATERIALIZED
 100 kb     MATERIALIZED
 250 kb     MATERIALIZED
-500 kb     DERIVED from 100 kb
+500 kb     MATERIALIZED
 1 Mb       MATERIALIZED
 2.5 Mb     MATERIALIZED
 ```
 
-The 25 kb, 250 kb, and 2.5 Mb matrices remain materialized for compatibility with the established `.hic` hierarchy. They are comparatively inexpensive because the data are already highly aggregated, so derivation would add query overhead for little storage benefit.
+The 25 kb, 250 kb, 500 kb, and 2.5 Mb matrices remain materialized for compatibility with the established `.hic` hierarchy. They are comparatively inexpensive because the data are already highly aggregated, so derivation would add query overhead for little storage benefit. In particular, the small savings from deriving 500 kb do not justify its query-time fan-out.
 
 The standard pyramid intentionally omits 20 kb and 200 kb. Although both can be produced exactly as 2× aggregations, their practical value does not justify the additional resolution metadata, normalization and expected-value vectors, reader complexity, and conformance testing. A specialized file MAY advertise them or other additional logical resolutions.
 
-The format MUST permit additional materialized or derived resolutions when a specialized file requires them, but the table above defines the recommended standard V10 hierarchy.
+The format permits additional materialized or derived resolutions when a specialized file requires them, but no extension may override the five mandatory derivations or derive 500 kb. The table above defines the standard V10 hierarchy.
 
 #### 1.3 Derived resolution semantics
 
@@ -1000,6 +1036,8 @@ Score matrices MUST NOT be implicitly aggregated unless the writer explicitly de
 
 A derived resolution MUST point directly to a materialized source resolution.
 
+For the five fixed high-resolution targets, the direct source is not a writer choice: `20 -> 10`, `50 -> 10`, `200 -> 100`, `500 -> 100`, and `2000 -> 1000` BP. The 500,000 bp level is never derived.
+
 For example:
 
 ```text
@@ -1081,7 +1119,7 @@ This improves both:
 - compression similarity;
 - probability that blocks are requested together.
 
-V10 does not require replacing the existing rotated cis geometry solely for compression purposes.
+V10 requires the existing rotated cis geometry. Together with the adaptive block scale in Section F.4, this preserves diagonal/distance locality and prevents ultra-fine cis maps from degenerating into enormous collections of nearly empty rectangular blocks.
 
 ---
 
@@ -1596,7 +1634,6 @@ For example:
 10 bp   -> 20 bp, 50 bp
 100 bp  -> 200 bp, 500 bp
 1 kb    -> 2 kb
-100 kb  -> 500 kb
 ```
 
 Source block dimensions SHOULD, where practical, be divisible by both `2` and `5`.
@@ -1635,7 +1672,7 @@ target resolution
 genomic tile
 ```
 
-This stores already aggregated 20 bp, 50 bp, 200 bp, 500 bp, 2 kb, or 500 kb results.
+This stores already aggregated 20 bp, 50 bp, 200 bp, 500 bp, or 2 kb results.
 
 This is particularly useful when:
 
@@ -1791,8 +1828,8 @@ hic repack --verify-derived-resolutions
 
 If verification fails:
 
-- the resolution remains materialized; or
-- the conversion fails in strict mode.
+- conversion of a mandatory target (20, 50, 200, 500, or 2,000 bp) fails;
+- a nonstandard optional derived target may remain materialized, unless strict mode requests failure.
 
 There is no silent approximation.
 
@@ -1910,7 +1947,6 @@ Particular attention should be paid to:
 50 bp  from 10 bp
 500 bp from 100 bp
 2 kb   from 1 kb
-500 kb from 100 kb
 ```
 
 because these exercise the virtual-resolution design.
@@ -1934,7 +1970,7 @@ The format should optimize total interactive query cost, not compression ratio i
 
 ---
 
-### 22. Recommended V10 Baseline
+### 22. Required V10 Baseline
 
 The recommended V10 implementation is therefore:
 
@@ -1952,6 +1988,7 @@ The recommended V10 implementation is therefore:
 50 kb
 100 kb
 250 kb
+500 kb
 1 Mb
 2.5 Mb
 ```
@@ -1964,7 +2001,6 @@ The recommended V10 implementation is therefore:
 200 bp
 500 bp
 2 kb
-500 kb
 ```
 
 Every advertised normalization or expected-value capability uses its own target-resolution data, including at derived matrix resolutions.
@@ -2030,9 +2066,9 @@ The largest change is the resolution pyramid:
 
 > Store the raw matrix at selected anchor resolutions, while treating intermediate 2× and 5× matrices as exact virtual views over those anchors.
 
-The important working resolutions **5 kb and 50 kb** remain materialized. The established coarse levels **25 kb, 250 kb, 1 Mb, and 2.5 Mb** are also retained physically for compatibility and inexpensive direct access. The sub-kilobase 5× resolutions, **50 bp and 500 bp**, remain derived, as does **500 kb** from **100 kb**. The standard hierarchy does not advertise 20 kb or 200 kb.
+The important working resolutions **5 kb and 50 kb** remain materialized. The established coarse levels **25 kb, 250 kb, 500 kb, 1 Mb, and 2.5 Mb** are also retained physically for compatibility and inexpensive direct access. The five mandatory virtual levels are **20 bp, 50 bp, 200 bp, 500 bp, and 2 kb**. The standard hierarchy does not advertise 20 kb or 200 kb.
 
-The second major change is to redesign fine-resolution blocks around what the data actually look like:
+The second major change is to retain V9-compatible rotated cis distance bands and adaptive, increasingly large blocks at fine resolutions, while redesigning the contents of those blocks around what the data actually look like:
 
 > a sorted sparse set of occupied positions whose values are overwhelmingly small integers and frequently equal to one.
 
