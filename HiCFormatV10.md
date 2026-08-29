@@ -1972,7 +1972,7 @@ The format should optimize total interactive query cost, not compression ratio i
 
 ### 22. Required V10 Baseline
 
-The recommended V10 implementation is therefore:
+The required V10 baseline is therefore:
 
 ##### Resolution storage
 
