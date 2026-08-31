@@ -26,14 +26,14 @@ The major V10 changes are:
 1. Store only selected matrix-resolution anchors; the 20, 50, 200, 500, and 2,000 bp matrices are always derived from raw anchor counts.
 2. Store normalization and expected-value vectors for every advertised logical resolution, including derived resolutions.
 3. Replace ZLib with Zstandard.
-4. Compress neighboring logical blocks together into bounded random-access pages.
+4. Compress every non-empty logical block independently for true block-level random access.
 5. Replace the sparse list-of-rows representation with flat delta-coded cell positions.
 6. Separate position and value streams.
 7. Exploit the count≈1 regime with implicit/default values and exception streams.
 8. Add adaptive sparse, bitmap, and dense block representations.
 9. Introduce an explicit integer count type rather than falling back from `short` to floating point.
 10. Compress normalization and expected-value vectors losslessly in independently accessible chunks.
-11. Replace the per-block absolute-position index with a compact page-oriented index.
+11. Use an exact binary block index with one locator per independently compressed logical block.
 
 ---
 
@@ -108,7 +108,7 @@ Unknown enumeration values are errors unless a later revision explicitly defines
 |---|---:|---|
 | `Unit.BP` | 0 | Base-pair bins |
 | `Unit.FRAG` | 1 | Restriction-fragment bins |
-| `StorageMode.MATERIALIZED` | 0 | Matrix pages are stored |
+| `StorageMode.MATERIALIZED` | 0 | Independently compressed logical blocks are stored |
 | `StorageMode.DERIVED` | 1 | Raw matrix is derived from a finer materialized resolution |
 | `Aggregation.NONE` | 0 | Resolution cannot be derived |
 | `Aggregation.SUM` | 1 | Target cells are sums of source cells |
@@ -116,7 +116,7 @@ Unknown enumeration values are errors unless a later revision explicitly defines
 | `ValueType.SCORE_FLOAT32` | 1 | Exact IEEE 754 binary32 scores |
 | `GridType.RECTANGULAR` | 0 | Ordinary row-major block grid |
 | `GridType.ROTATED_CIS` | 1 | V9-compatible rotated cis grid |
-| `PageCodec.ZSTD` | 1 | Zstandard frame without a preset dictionary |
+| `BlockCodec.ZSTD` | 1 | Zstandard frame without a preset dictionary |
 | `BlockRepresentation.SPARSE_DELTA` | 0 | Sorted occupied positions encoded as deltas |
 | `BlockRepresentation.BITMAP` | 1 | One presence bit per cell |
 | `BlockRepresentation.DENSE` | 2 | Every cell has a value slot |
@@ -137,8 +137,8 @@ A conforming file MUST satisfy all of the following:
 - chromosome-pair keys are canonical with `chr1Index <= chr2Index`;
 - matrix and vector directory keys are unique;
 - every logical matrix cell is encoded at most once;
-- page ranges are ordered and non-overlapping within a resolution;
-- logical block numbers are strictly increasing within a page;
+- logical block numbers are strictly increasing within each resolution block index;
+- every indexed matrix block has one independently compressed stored-block record;
 - sparse positions and exception ordinals are strictly increasing;
 - counts never overflow `u64` while decoding or deriving;
 - the exact full-matrix count sum fits `u64`;
@@ -157,8 +157,8 @@ The physical order produced by the reference writer is:
 ```text
 Header
 Matrix metadata records
-Materialized-resolution page indexes
-Materialized matrix pages
+Independently compressed matrix blocks
+Materialized-resolution block indexes
 Normalization-vector chunks
 Expected-value chunks
 Normalized-expected-value chunks
@@ -168,7 +168,7 @@ Normalized-expected-value index
 Footer / matrix master index
 ```
 
-The offsets are authoritative, so a writer MAY choose another order. Pages belonging to one materialized matrix resolution MUST nevertheless be physically contiguous and ordered exactly as their page-index descriptors because page offsets are reconstructed cumulatively.
+The offsets are authoritative, so a writer MAY choose another order. Writers SHOULD store the blocks of one materialized matrix resolution contiguously in increasing block-number order so readers can coalesce adjacent local or HTTP range reads, but readers MUST use the exact index locators and MUST NOT depend on physical contiguity.
 
 Seekable writers normally reserve and write the header, emit the remaining structures, then backpatch header offsets and lengths. A streaming producer MUST stage enough metadata to emit a correct final seekable file; V10 does not define an unpatched streaming variant.
 
@@ -181,9 +181,9 @@ Fixed-size record summary:
 | Footer matrix entry | 24 |
 | Matrix record header | 24 |
 | Matrix resolution descriptor | 76 |
-| Page-index header | 32 |
-| Page-index checkpoint | 32 |
-| Stored page header | 16 |
+| Block-index header | 24 |
+| Block-index entry | 16 |
+| Stored block-record header | 16 |
 | Logical block header | 40 |
 | Vector-index header | 16 |
 | Vector chunk descriptor | 32 |
@@ -310,7 +310,7 @@ Each matrix entry is:
 | `matrixPosition` | `u64` | Position of the matrix metadata record |
 | `matrixByteLength` | `u64` | Exact matrix metadata record length |
 
-Entries MUST be sorted by `(chr1Index, chr2Index)` and unique. Unlike V9, V10 does not store textual keys such as `0_1`; the numeric pair is the key. A chromosome pair with no directory entry is an all-zero raw matrix at every logical resolution. The footer contains metadata locators only; matrix page bytes are not included in `matrixByteLength`.
+Entries MUST be sorted by `(chr1Index, chr2Index)` and unique. Unlike V9, V10 does not store textual keys such as `0_1`; the numeric pair is the key. A chromosome pair with no directory entry is an all-zero raw matrix at every logical resolution. The footer contains metadata locators only; stored block bytes are not included in `matrixByteLength`.
 
 The footer length is exactly `24 + 24 * matrixEntryCount` bytes.
 
@@ -353,18 +353,18 @@ Every logical resolution, including a derived resolution, has one fixed 76-byte 
 | `percent95` | `f32` | Estimated 95th percentile among occupied values; NaN if not computed |
 | `blockBinCount` | `u32` | Positive logical block scale in bins |
 | `blockColumnCount` | `u32` | Positive number of columns along the grid's primary axis |
-| `pageIndexPosition` | `u64` | Page index position, or zero for a derived resolution |
-| `pageIndexLength` | `u64` | Page index length, or zero for a derived resolution |
-| `pageCount` | `u32` | Number of stored pages; zero for a derived resolution |
-| `logicalBlockCount` | `u32` | Total physically stored non-empty blocks; zero for a derived resolution |
+| `blockIndexPosition` | `u64` | Exact block-index position, or zero when absent |
+| `blockIndexLength` | `u64` | Exact block-index length, or zero when absent |
+| `logicalBlockCount` | `u32` | Total physically stored non-empty blocks; zero for a derived or empty resolution |
+| `reserved1` | `u32` | Zero |
 
 For `COUNT_UINT`, `sumCountsOrScores` is the exact unsigned sum over the stored canonical matrix cells. For `SCORE_FLOAT32`, scores are visited by increasing global bin row and then bin column, converted exactly to binary64, and added using round-to-nearest, ties-to-even; the resulting binary64 bits are stored, including an IEEE result such as NaN or infinity. `occupiedCellCount` is an integer, not a float. Zero-valued count cells are absent; a present score may have any `f32` bit pattern, including `+0`, `-0`, or NaN.
 
 `stdDev` and `percent95` are descriptive metadata and do not affect decoding. Writers that do not compute either field MUST store the canonical quiet-NaN bits `0x7fc00000`, not zero.
 
-A materialized descriptor MUST address a page index, except that an all-empty matrix may use `(pageIndexPosition, pageIndexLength, pageCount, logicalBlockCount) = (0, 0, 0, 0)`. For a non-empty materialized resolution, `logicalBlockCount` MUST equal the sum of the `blockCount` fields in all its pages. A derived descriptor MUST set all four storage fields to zero. Its `valueType`, grid metadata, statistics, and auxiliary vectors describe the target resolution, not the source.
+A non-empty materialized descriptor MUST address a block index and have `logicalBlockCount > 0`. An all-empty materialized resolution and every derived resolution MUST use `(blockIndexPosition, blockIndexLength, logicalBlockCount, reserved1) = (0, 0, 0, 0)`. The block-index entry count MUST equal `logicalBlockCount`. A derived descriptor's `valueType`, grid metadata, statistics, and auxiliary vectors describe the target resolution, not the source.
 
-Every descriptor in a cis matrix record, including a derived or empty descriptor, MUST use `ROTATED_CIS`. Every descriptor in a trans matrix record MUST use `RECTANGULAR`. This invariant lets readers reject geometry ambiguity before fetching pages.
+Every descriptor in a cis matrix record, including a derived or empty descriptor, MUST use `ROTATED_CIS`. Every descriptor in a trans matrix record MUST use `RECTANGULAR`. This invariant lets readers reject geometry ambiguity before fetching blocks.
 
 Within one matrix record, a derived descriptor and its declared source descriptor MUST have the same `valueType`. A missing chromosome-pair footer entry denotes an all-zero `COUNT_UINT` matrix. Therefore a file using `SCORE_FLOAT32` for any omitted chromosome pair MUST instead emit an explicit matrix record for that pair, even when it has no occupied cells.
 
@@ -425,101 +425,52 @@ blockBinCount = max(requestedMinimumBlockBinCount, adaptiveB)
 
 All products MUST use checked sufficiently wide arithmetic. A writer MUST further increase `blockBinCount` if needed to keep every possible block number in `u32`. The standard requested minimum is 256 bins. A writer option may increase that minimum, but MUST NOT reduce the adaptive minimum. This policy deliberately makes blocks much larger as BP resolution becomes finer while retaining bounded logical grids and V9-compatible cis distance bands.
 
-### G. Resolution Page Index
+### G. Resolution Block Index
 
-Every non-empty materialized resolution has one uncompressed page index. Its length is `pageIndexLength`:
+Every non-empty materialized resolution has one uncompressed exact block index. Its length is `blockIndexLength`:
 
 | Field | Type | Meaning |
 |---|---|---|
 | `indexMagic` | 4 bytes | ASCII `H10I` |
-| `indexVersion` | `u32` | 1 |
-| `pageCount` | `u32` | Must match the matrix descriptor |
-| `checkpointInterval` | `u32` | Positive; 64 is recommended |
-| `checkpointCount` | `u32` | `ceil(pageCount / checkpointInterval)` |
+| `indexVersion` | `u32` | 2 |
+| `indexByteLength` | `u64` | Exact length of this index record |
+| `blockCount` | `u32` | Must equal the matrix descriptor's `logicalBlockCount` |
 | `reserved` | `u32` | Zero |
-| `descriptorByteLength` | `u64` | Length of the descriptor blob |
-| checkpoints | 32 bytes each | Repeated `checkpointCount` times |
-| descriptor blob | bytes | Exactly `descriptorByteLength` bytes |
+| block entries | 16 bytes each | Repeated `blockCount` times |
 
-The page-index length is exactly `32 + 32 * checkpointCount + descriptorByteLength` bytes and MUST equal `pageIndexLength`.
+The block-index length is exactly `24 + 16 * blockCount` bytes and MUST equal both `indexByteLength` and `blockIndexLength`.
 
-Each checkpoint starts an independently decodable group:
+Each block entry is:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `firstPageOrdinal` | `u32` | Zero-based page ordinal |
-| `pagesInGroup` | `u32` | Positive and at most `checkpointInterval` |
-| `firstBlockNumber` | `u32` | First page's inclusive block-range start |
-| `reserved` | `u32` | Zero |
-| `firstPagePosition` | `u64` | Absolute position of the first stored page record |
-| `descriptorOffset` | `u64` | Offset from the start of the descriptor blob |
+| `blockNumber` | `u32` | Exact logical block number |
+| `storedByteLength` | `u32` | Stored-block header plus one Zstandard frame; greater than 16 |
+| `blockPosition` | `u64` | Absolute file position of the stored-block record |
 
-Checkpoints MUST cover page ordinals contiguously from zero. Within a checkpoint group, decode descriptors as follows:
+Entries MUST be sorted by strictly increasing `blockNumber`. Every indexed interval MUST be in bounds, MUST contain exactly one stored-block record defined in Section H, and MUST NOT overlap any other indexed block interval. An absent block number denotes an empty logical block.
 
-```text
-first page:
-    blockSpanMinus1     uleb128
-    storedByteLength    uleb128
-    uncompressedBytes   uleb128
+The exact locators permit direct binary search and at most one direct range read per requested block. Readers MAY sort and coalesce contiguous requested intervals into a single local or HTTP range read, but every block remains independently decompressible and no query may require bytes from an unrequested block.
 
-each later page:
-    blockGap            uleb128
-    blockSpanMinus1     uleb128
-    storedByteLength    uleb128
-    uncompressedBytes   uleb128
-```
+`indexVersion = 2` intentionally distinguishes this exact block index from the grouped-block `H10I` version 1 used by pre-final V10 drafts. A conforming reader MUST reject version 1 rather than interpreting it as this layout.
 
-For the first page, `firstBlock = checkpoint.firstBlockNumber` and `pagePosition = checkpoint.firstPagePosition`. For a later page:
+### H. Stored Matrix Block
 
-```text
-firstBlock  = previousLastBlock + 1 + blockGap
-pagePosition = previousPagePosition + previousStoredByteLength
-```
-
-For every page:
-
-```text
-lastBlock = firstBlock + blockSpanMinus1
-```
-
-The block ranges MUST be ordered and non-overlapping. For each page, `firstBlock` and `lastBlock` MUST equal the smallest and largest block numbers in its internal directory. Numbers between them may be absent and are empty. `storedByteLength` includes the 16-byte page header plus its Zstandard frame and MUST be greater than 16. `uncompressedBytes` is the size of the decompressed page payload and MUST fit `u32`.
-
-Pages for the resolution MUST be contiguous in ordinal order, with no padding or unrelated data between them. Consequently, every checkpoint after the first MUST have `firstPagePosition` equal to the previous group's final page position plus that page's `storedByteLength`. A reader locates a block by binary-searching checkpoint `firstBlockNumber` values, decoding at most one checkpoint group, and testing the candidate page range. It then confirms presence using the page's internal block directory.
-
-`descriptorOffset` values MUST be strictly increasing, the first MUST be zero, each group MUST end exactly at the next group's offset, and the final group MUST end exactly at `descriptorByteLength`. Trailing or unreferenced descriptor bytes are invalid.
-
-### H. Stored Matrix Page
-
-Each page is independently decompressible and starts with a 16-byte uncompressed header:
+Each non-empty logical block is independently decompressible and starts with this 16-byte uncompressed stored-record header:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `pageMagic` | 4 bytes | ASCII `H10P` |
+| `recordMagic` | 4 bytes | ASCII `H10B` |
 | `codec` | `u8` | `ZSTD` (1) |
-| `pageVersion` | `u8` | 1 |
-| `pageFlags` | `u16` | Zero |
-| `uncompressedBytes` | `u32` | Decompressed payload length |
-| `blockCount` | `u32` | Number of non-empty logical blocks |
-| `compressedPayload` | bytes | One complete Zstandard frame |
+| `recordVersion` | `u8` | 1 |
+| `recordFlags` | `u16` | Zero |
+| `uncompressedBytes` | `u32` | Exact decompressed logical-block length |
+| `blockNumber` | `u32` | Must match the selected block-index entry |
+| `compressedPayload` | bytes | One complete Zstandard frame containing one logical block |
 
-`blockCount` MUST be positive. The Zstandard frame consumes exactly `storedByteLength - 16` bytes and MUST decompress to exactly `uncompressedBytes`. It MUST be one ordinary Zstandard data frame as defined by [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html), not a skippable frame or a concatenation of frames. Preset dictionaries are forbidden. The frame checksum flag MAY be used and MUST be verified by readers when present. Compression level is a writer choice and is not stored because it does not affect decoding.
+The Zstandard frame consumes exactly `storedByteLength - 16` bytes and MUST decompress to exactly `uncompressedBytes`. The decompressed bytes are exactly one logical block encoded by Section I; `uncompressedBytes` MUST equal `40 + positionStreamBytes + valueStreamBytes`. No block directory or additional block payload may appear in the frame.
 
-The decompressed payload is:
-
-| Field | Type | Meaning |
-|---|---|---|
-| `directoryByteLength` | `u32` | Exact length of the following block directory |
-| block directory | bytes | `blockCount` pairs of `uleb128` values |
-| block payloads | bytes | Encoded blocks concatenated in directory order |
-
-Each directory pair is:
-
-```text
-blockNumberDelta  uleb128
-blockByteLength   uleb128
-```
-
-For the first entry, `blockNumber = blockNumberDelta`. For each later entry, `blockNumber = previousBlockNumber + blockNumberDelta`; later deltas MUST be positive. Block numbers MUST fall within the page range recorded in the page index. `blockByteLength` MUST be positive. Payload offsets are reconstructed by cumulative block lengths, beginning immediately after the directory. Their sum MUST equal the remaining decompressed payload length.
+The payload MUST be one ordinary Zstandard data frame as defined by [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html), not a skippable frame or concatenation of frames. Preset dictionaries are forbidden. The frame checksum flag MAY be used and MUST be verified by readers when present. Compression level is a writer choice and is not stored because it does not affect decoding.
 
 ### I. Logical Block Encoding
 
@@ -543,7 +494,7 @@ Every logical block begins with this fixed 40-byte header:
 | `positionStreamBytes` | `u32` | Exact position-stream length |
 | `valueStreamBytes` | `u32` | Exact value-stream length |
 
-The two streams immediately follow the header, position stream first. Their lengths plus 40 MUST equal `blockByteLength`. Local position `p` maps to:
+The two streams immediately follow the header, position stream first. Their lengths plus 40 MUST equal the enclosing stored record's `uncompressedBytes`. Local position `p` maps to:
 
 ```text
 localRow    = floor(p / W)
@@ -762,13 +713,13 @@ A minimal random-access reader performs these steps:
 2. Read through `headerByteLength`; build chromosome, resolution, fragment-site, attribute, and normalization-type tables.
 3. Read the footer and binary-search its numeric matrix entries for the canonical chromosome pair.
 4. Read the selected matrix metadata record and select the descriptor by `(unit, resolutionIndex)`.
-5. For a materialized resolution, read its page index, map candidate logical block numbers to page ranges, fetch each page once, validate and decompress it, locate blocks in its internal directory, and decode block streams.
+5. For a materialized resolution, read its exact block index, map candidate logical block numbers to entries, fetch and independently decompress only the indexed blocks that exist, and decode their block streams.
 6. For a derived resolution, query the declared materialized source over the expanded source-bin rectangle and aggregate raw values using Section K.
 7. Filter decoded or aggregated cells to the exact requested half-open interval and transpose if the original chromosome order was noncanonical.
 8. If requested, range-read the target-resolution normalization chunks and apply normalization.
 9. If requested, range-read the matching target-resolution expected chunks and apply O/E.
 
-A remote reader does not need to download structures unrelated to the requested chromosome pair, resolution, pages, vector ranges, or expected-distance ranges.
+A remote reader does not need to download structures unrelated to the requested chromosome pair, resolution, logical blocks, vector ranges, or expected-distance ranges.
 
 ### M. Required Writer Procedure
 
@@ -779,13 +730,13 @@ A conforming writer:
 3. stores exact raw counts as `COUNT_UINT` and genuine scores as `SCORE_FLOAT32`;
 4. assigns every materialized contact to exactly one logical block;
 5. sorts cells within each block, chooses a valid adaptive representation and value mode, and emits canonical varints;
-6. groups neighboring non-empty blocks into bounded pages without crossing matrix-resolution boundaries;
-7. writes independent Zstandard pages and builds checkpointed page indexes;
+6. compresses every non-empty logical block as its own independent Zstandard stored-block record;
+7. builds an exact block index containing one locator for every stored logical block;
 8. computes or preserves every advertised target-resolution normalization and expected vector, chunks it, applies the smallest supported exact transform, and writes independent Zstandard chunks;
 9. emits matrix and vector indexes, then the footer;
 10. backpatches every header locator and verifies every referenced interval and duplicated field.
 
-Writers SHOULD target 64–256 KiB compressed matrix pages, approximately 128 KiB by default, and 65,536 `f32` values per vector chunk. These are performance recommendations, not compatibility requirements.
+Writers SHOULD target 65,536 `f32` values per vector chunk. Matrix block boundaries are determined exclusively by the logical block geometry; writers MUST NOT combine logical blocks merely to improve compression ratio.
 
 ### N. Validation and Defensive Reading
 
@@ -793,8 +744,8 @@ Before allocation, a reader MUST validate counts and products against the contai
 
 - `headerByteLength`, footer length, index lengths, and every `entryByteLength`;
 - `W * H`, bitmap byte count, value-slot count, and scalar decode count;
-- page and vector decompressed sizes before invoking Zstandard;
-- descriptor coverage, cumulative stored positions, and cumulative block lengths;
+- block and vector decompressed sizes before invoking Zstandard;
+- block-index length, strict block-number order, stored lengths, and non-overlapping indexed intervals;
 - ULEB128 overflow and maximum length;
 - derived-resolution factors and `u64` sum overflow;
 - vector chunk coverage and `4 * valueCount` overflow;
@@ -822,7 +773,7 @@ V10 is a new wire format selected by `version = 10`; a V9 reader cannot parse a 
 | `occupiedCellCount` | Exact `u64` |
 | `stdDev`, `percent95` | Explicit `f32`; unavailable values are NaN |
 | `blockSize`, `blockColumnCount` | `blockBinCount`, `blockColumnCount`, and `gridType` |
-| `blockCount` and per-block position/size index | Resolution `logicalBlockCount`, checkpointed page index, and each page's block directory |
+| `blockCount` and per-block position/size index | Resolution `logicalBlockCount` and exact binary block index with `u64` positions |
 | `nRecords` | Block `occupiedCellCount` |
 | `binColumnOffset`, `binRowOffset` | Fixed block header offsets |
 | short/int position flags | Canonical `uleb128` position streams |
@@ -1056,78 +1007,48 @@ This keeps query cost predictable and prevents cascading decode operations.
 
 ---
 
-### 2. Logical Blocks and Compression Pages
+### 2. Independently Compressed Logical Blocks
 
-#### 2.1 Separate spatial blocks from compression units
+#### 2.1 The logical block is the random-access unit
 
-V10 retains the concept of a **logical block** for genomic addressing.
-
-However, logical blocks are no longer individually compressed.
-
-Instead, several spatially adjacent logical blocks are grouped into a **compression page**.
+V10 retains the concept of a **logical block** for genomic addressing and makes that same block the fundamental compression and random-access unit:
 
 ```text
 Matrix
   └── Resolution
-       └── Compression Page
-            ├── Logical Block
-            ├── Logical Block
-            ├── Logical Block
-            └── ...
+       ├── Independently compressed logical block
+       ├── Independently compressed logical block
+       └── ...
 ```
 
-The page is the fundamental:
+Every non-empty logical block has:
 
-- compressed unit;
-- disk-read unit;
-- HTTP range-read unit;
-- decompression unit;
-- cache unit.
+- one exact block-index entry;
+- one stored-block header;
+- one independent Zstandard frame;
+- one logical-block payload.
 
-Logical blocks remain the spatial indexing unit inside the page.
+A reader requesting one block never needs to read, decompress, or decode another block. This property controls read amplification for small local and remote queries.
 
-#### 2.2 Page sizing
+#### 2.2 Physical ordering and read coalescing
 
-The recommended target is approximately:
+Writers SHOULD store blocks from one matrix resolution contiguously in increasing block-number order. This layout lets readers combine adjacent indexed intervals into one disk or HTTP range read for broad queries without changing the independent compression boundary.
 
-```text
-128 KiB compressed per page
-```
-
-with a practical target range of approximately:
-
-```text
-64–256 KiB
-```
-
-Writers MAY adjust page size according to local density, but SHOULD impose a bounded maximum page size.
-
-Pages MUST NOT span unrelated chromosome-pair matrices.
-
-Pages SHOULD contain blocks that are adjacent in block-number/genomic order.
-
-This provides enough data for the compressor to exploit statistical redundancy without turning a small viewport query into a multi-megabyte read.
+Physical ordering is an optimization only. Exact `u64` locators in the block index remain authoritative, so readers do not reconstruct positions from cumulative sizes and do not depend on block adjacency.
 
 #### 2.3 Cis ordering
 
-V10 retains the useful V9 principle of organizing cis blocks according to diagonal/anti-diagonal locality.
+V10 retains the useful V9 principle of organizing cis blocks according to diagonal/anti-diagonal locality. The required rotated cis geometry and adaptive block scale in Section F.4 preserve distance locality and prevent ultra-fine cis maps from degenerating into enormous collections of nearly empty rectangular blocks.
 
-Blocks grouped into the same page SHOULD come from the same or neighboring distance bands.
-
-This improves both:
-
-- compression similarity;
-- probability that blocks are requested together.
-
-V10 requires the existing rotated cis geometry. Together with the adaptive block scale in Section F.4, this preserves diagonal/distance locality and prevents ultra-fine cis maps from degenerating into enormous collections of nearly empty rectangular blocks.
+Readers MUST compute both the nearest and farthest candidate distance bands for a cis query. They MUST NOT search every band from zero through the farthest band unless the requested rectangle actually crosses the diagonal.
 
 ---
 
 ### 3. Zstandard Compression
 
-All matrix pages and compressed vector chunks use **Zstandard** rather than ZLib. Section H fixes the interoperable frame requirements and uses the framing defined by [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html).
+All stored matrix blocks and compressed vector chunks use **Zstandard** rather than ZLib. Section H fixes the interoperable matrix-block frame requirements and uses the framing defined by [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878.html).
 
-Each page is independently decompressible.
+Each logical matrix block is independently decompressible.
 
 The compression level is a writer policy, not part of the logical data model.
 
@@ -1149,7 +1070,7 @@ For example:
 
 All profiles remain fully interoperable because decompression does not depend on the writer's selected compression level.
 
-The reader MUST never require decompression of data preceding the requested page.
+The reader MUST never require decompression of another matrix block to decode the requested block.
 
 ---
 
@@ -1237,7 +1158,7 @@ row
 
 Position data and contact values MUST be separate streams inside the block representation.
 
-This allows each stream to expose its own statistical regularity before page compression.
+This allows each stream to expose its own statistical regularity before the logical block is compressed.
 
 The compressor therefore sees runs of:
 
@@ -1399,91 +1320,37 @@ The writer chooses among these modes per block.
 
 ---
 
-### 10. Page Contents
+### 10. Stored Block Records
 
-A matrix page contains:
-
-```text
-Page Header
-Block Directory
-Encoded Logical Blocks
-```
-
-The page header fields are defined exactly in Section H and include:
+Each non-empty logical block is wrapped in one stored record:
 
 ```text
-codec
-uncompressedSize
-blockCount
+H10B stored-record header
+one Zstandard frame
+    └── one encoded logical block
 ```
 
-The internal block directory identifies the logical block numbers contained in the page and their locations within the decompressed page.
+The stored header supplies the codec, decompressed length, and logical block number. The independently compressed payload contains the Section I block header followed by its position and value streams. No stored record contains more than one logical block.
 
-Once a page has been decompressed, multiple nearby block queries therefore require no additional I/O or decompression.
+This one-to-one relationship makes read amplification explicit and bounded: fetching a requested block never entails decoding unrelated blocks. Readers may still coalesce adjacent stored-record byte ranges when a query needs several blocks.
 
 ---
 
-### 11. Compact Page-Oriented Index
+### 11. Exact Block Index
 
-V10 replaces the large per-block:
+V10 stores one fixed-width locator for every non-empty logical block:
 
 ```text
 blockNumber
+storedByteLength
 absoluteFilePosition
-compressedSize
 ```
 
-index with a page-oriented index.
+The entries are strictly ordered by block number, so a reader can use binary search without decoding preceding entries or reconstructing cumulative positions. Empty logical blocks have no entry.
 
-#### 11.1 Resolution-level page directory
+The modest index-space cost is deliberate. Exact `u64` positions avoid the read amplification and lookup ambiguity caused by grouping blocks behind range-only descriptors. Implementations may memory-map or cache an index and may merge adjacent block intervals into larger reads.
 
-For each materialized matrix resolution, the metadata records pages in physical file order.
-
-Page descriptors contain enough information to identify:
-
-- the range/set of block numbers in the page;
-- compressed page size;
-- page location.
-
-Because page data is written sequentially, file positions SHOULD be represented primarily by:
-
-```text
-baseOffset + cumulative compressed sizes
-```
-
-rather than storing a complete 64-bit absolute file offset for every page.
-
-#### 11.2 Delta coding
-
-The exact page index uses unsigned encodings as follows:
-
-```text
-logical block identifiers  -> positive deltas
-page file positions        -> checkpoint absolute position + cumulative stored lengths
-page stored lengths        -> canonical uleb128 values
-```
-
-Section G defines the complete descriptor grammar; writers MUST NOT substitute a different delta scheme.
-
-#### 11.3 Checkpoints
-
-To avoid scanning the entire size list to locate an arbitrary page, the index includes periodic absolute checkpoints.
-
-A recommended initial interval is:
-
-```text
-one checkpoint every 64 pages
-```
-
-A lookup therefore performs:
-
-1. locate the nearest checkpoint;
-2. decode at most a bounded number of descriptors;
-3. issue the corresponding range read.
-
-This keeps the index both compact and random-access friendly.
-
-#### 11.4 Numeric matrix keys
+#### 11.1 Numeric matrix keys
 
 Chromosome-pair matrix keys MUST use chromosome indices directly rather than constructing textual keys such as chromosome-index strings.
 
@@ -1592,15 +1459,15 @@ Example:
 500 bp -> source 100 bp
 ```
 
-##### Step 2 — identify source pages
+##### Step 2 — identify source blocks
 
 The requested genomic rectangle is converted to the corresponding 100 bp source region.
 
-The page index identifies the source pages overlapping that region.
+The exact block index identifies the stored source blocks overlapping that region.
 
-##### Step 3 — decode pages
+##### Step 3 — decode blocks
 
-Only those pages are fetched and decompressed.
+Only those independently compressed blocks are fetched and decompressed.
 
 ##### Step 4 — reconstruct source contacts
 
@@ -1638,9 +1505,7 @@ For example:
 
 Source block dimensions SHOULD, where practical, be divisible by both `2` and `5`.
 
-Pages SHOULD preserve genomic locality.
-
-This minimizes source-page fan-out when serving derived queries and improves reuse between zoom levels.
+The rotated or rectangular block geometry SHOULD preserve genomic locality. This minimizes source-block fan-out when serving derived queries and improves reuse between zoom levels.
 
 The optimization does not alter the mathematical bin boundaries: all target bins remain aligned to chromosome coordinate zero and are exact integer aggregations of the source bins.
 
@@ -1650,14 +1515,14 @@ The optimization does not alter the mathematical bin boundaries: all target bins
 
 Caching is not part of the persistent binary semantics, but V10 readers SHOULD maintain two independent caches.
 
-#### 16.1 Decompressed page cache
+#### 16.1 Decompressed block cache
 
 Keyed approximately by:
 
 ```text
 chromosome pair
 materialized resolution
-page ID
+logical block number
 ```
 
 This avoids repeated network reads and Zstandard decompression while panning.
@@ -1703,10 +1568,10 @@ stdDev
 percent95
 blockBinCount
 blockColumnCount
-pageIndexPosition
-pageIndexLength
-pageCount
+blockIndexPosition
+blockIndexLength
 logicalBlockCount
+reserved1
 ```
 
 For example:
@@ -1725,7 +1590,7 @@ storageMode   = MATERIALIZED
 sourceResolutionIndex = 0xFFFFFFFF
 ```
 
-Derived resolutions do not have their own matrix page index because no matrix pages exist for that resolution.
+Derived resolutions do not have their own matrix block index because no matrix blocks exist for that resolution.
 
 They still participate normally in normalization and expected-value indexes.
 
@@ -1751,10 +1616,10 @@ MATRIX METADATA RECORDS
         resolution descriptors
 
 MATERIALIZED MATRIX DATA
-    page index
-    compressed matrix pages
-    page index
-    compressed matrix pages
+    exact block index
+    independently compressed matrix blocks
+    exact block index
+    independently compressed matrix blocks
     ...
 
 NORMALIZATION-VECTOR CHUNKS
@@ -1778,8 +1643,6 @@ materialized or derived
         ↓
 logical block
         ↓
-compression page
-        ↓
 position stream + value stream
         ↓
 Zstandard
@@ -1802,9 +1665,9 @@ For each matrix and materialized resolution:
 3. sort records into V10 logical-block order;
 4. select sparse/bitmap/dense representation;
 5. select the best value mode;
-6. group blocks into pages;
-7. Zstandard-compress pages;
-8. construct the compact page index.
+6. wrap and Zstandard-compress every non-empty logical block independently;
+7. record each block's exact position and stored length;
+8. construct the exact binary block index.
 
 #### 19.2 Virtual-resolution verification
 
@@ -1897,7 +1760,7 @@ V10 core matrix and vector storage performs no:
 
 No ordinary regional query should require decompressing an entire chromosome matrix, entire resolution, or entire file.
 
-Every matrix page and vector chunk is independently addressable.
+Every matrix block and vector chunk is independently addressable.
 
 ---
 
@@ -1910,7 +1773,7 @@ At minimum, measure:
 ##### File-size components
 
 ```text
-matrix pages
+stored matrix blocks
 matrix indexes
 normalization vectors
 expected vectors
@@ -1927,7 +1790,9 @@ p50 latency
 p95 latency
 p99 latency
 bytes fetched per query
-pages decompressed per query
+blocks fetched per query
+blocks decompressed per query
+unrequested blocks decompressed per query
 ```
 
 Test separately:
@@ -2016,9 +1881,7 @@ separate positions and values
     ↓
 ALL_DEFAULT / DEFAULT_EXCEPTIONS / DIRECT
     ↓
-bounded multi-block pages
-    ↓
-Zstandard
+one independent Zstandard frame per logical block
 ```
 
 ##### Count representation
@@ -2048,13 +1911,13 @@ with exact reconstruction of every original float32 bit.
 ##### Indexing
 
 ```text
-page-level indexes
-delta-coded identifiers
-delta/cumulative positions
-periodic absolute checkpoints
+exact block-level indexes
+strictly ordered block numbers
+absolute `u64` positions
+explicit stored byte lengths
 ```
 
-rather than an absolute position and size for every compressed logical block.
+rather than a range-only index over groups of compressed logical blocks.
 
 ---
 
@@ -2072,7 +1935,7 @@ The second major change is to retain V9-compatible rotated cis distance bands an
 
 > a sorted sparse set of occupied positions whose values are overwhelmingly small integers and frequently equal to one.
 
-Flat position deltas, implicit values, bitmap/dense alternatives, page compression, and Zstandard exploit those properties without changing a single contact count.
+Flat position deltas, implicit values, bitmap/dense alternatives, independent block compression, and Zstandard exploit those properties without changing a single contact count.
 
 Finally, auxiliary arrays and indexes become compressed and range-addressable rather than remaining disproportionately expensive metadata at ultra-fine resolutions.
 
