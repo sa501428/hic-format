@@ -85,14 +85,31 @@ All file positions are absolute `u64` byte offsets from the first byte of the fi
 
 The addition MUST be checked for overflow and the resulting interval MUST lie within the file. A zero position and zero length mean that an optional structure is absent. A locator pair with only one zero value is invalid. No valid present structure has a zero length.
 
-Genomic coordinates and bin intervals are also zero-based and half-open. For base-pair resolution `R`:
+Stored matrix bin indices are zero-based. V10 does not prescribe whether pair-level source
+positions use zero-based, one-based, or another producer convention; writers consume the
+numeric positions supplied by the producer without origin conversion. The canonical BP
+matrix geometry for resolution `R` is:
 
 ```text
-binIndex = floor(position / R)
 binStart = binIndex * R
 binEnd   = min((binIndex + 1) * R, chromosomeLength)
 nBins    = ceil(chromosomeLength / R)
 ```
+
+Every stored `binIndex` MUST be less than `nBins`. A writer that accepts unbinned source
+positions in the inclusive numeric range `[0, chromosomeLength]` maps them with:
+
+```text
+binIndex = min(floor(position / R), nBins - 1)
+```
+
+Thus both numeric endpoints are accepted and a position equal to `chromosomeLength` is
+folded into the final real bin. Values between the endpoints are used exactly as supplied;
+the writer neither infers nor records their coordinate origin. Internal bin ranges and the
+reader procedure below remain half-open because they address matrix array indices, not the
+coordinate convention of the source data. External query APIs consume numeric bounds as
+supplied and MAY separately define whether a range end is inclusive or exclusive; V10 does
+not require those APIs to label the caller's coordinate origin.
 
 #### A.4 Floating-point requirements
 
@@ -280,7 +297,7 @@ When at least one FRAG resolution is advertised, one site list follows for every
 | `nSites` | `u32` | Number of restriction cut sites |
 | `sitePosition` | `u64` | Repeated `nSites` times |
 
-Site positions MUST be strictly increasing, greater than zero, and less than the chromosome length. They are zero-based cut coordinates. Chromosome coordinate `p` belongs to fragment:
+Site positions MUST be strictly increasing, greater than zero, and less than the chromosome length. They are stored cut positions in the producer's numeric coordinate space; V10 does not record or infer the origin of the source convention. A supplied chromosome coordinate `p` belongs to fragment:
 
 ```text
 fragmentIndex = number of sitePosition values <= p
@@ -725,7 +742,7 @@ A remote reader does not need to download structures unrelated to the requested 
 
 A conforming writer:
 
-1. canonicalizes chromosome pairs and cis triangles;
+1. consumes external numeric positions as supplied, folds a value equal to the chromosome length into the final real bin, and canonicalizes chromosome pairs and cis triangles;
 2. constructs the logical resolution lists and validates every derived source;
 3. stores exact raw counts as `COUNT_UINT` and genuine scores as `SCORE_FLOAT32`;
 4. assigns every materialized contact to exactly one logical block;
