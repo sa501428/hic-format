@@ -23,7 +23,7 @@ The central design principle is:
 
 The major V10 changes are:
 
-1. Store only selected matrix-resolution anchors; the 20, 50, 200, 500, and 2,000 bp matrices are always derived from raw anchor counts.
+1. Store only selected matrix-resolution anchors; the 2, 5, 20, 50, 200, 500, and 2,000 bp matrices are always derived from raw anchor counts.
 2. Store normalization and expected-value vectors for every advertised logical resolution, including derived resolutions.
 3. Replace ZLib with Zstandard.
 4. Compress every non-empty logical block independently for true block-level random access.
@@ -162,7 +162,7 @@ A conforming file MUST satisfy all of the following:
 - every chromosome's bin count at every advertised resolution fits `u32`;
 - every computed logical block number fits `u32`;
 - all advertised derived resolutions point directly to a finer materialized resolution in the same unit;
-- advertised BP resolutions 20, 50, 200, 500, and 2,000 use the mandatory sources defined in Section C.3;
+- advertised BP resolutions 2, 5, 20, 50, 200, 500, and 2,000 use the mandatory sources defined in Section C.3;
 - an advertised 500,000 bp resolution is materialized;
 - cis matrix descriptors use `ROTATED_CIS` and trans descriptors use `RECTANGULAR`;
 - all unused flag bits and reserved bytes are zero.
@@ -277,6 +277,8 @@ The following BP storage policy is mandatory whenever the target resolution is a
 
 | Target BP resolution | Required storage | Required source |
 |---:|---|---:|
+| 2 | `DERIVED` | 1 |
+| 5 | `DERIVED` | 1 |
 | 20 | `DERIVED` | 10 |
 | 50 | `DERIVED` | 10 |
 | 200 | `DERIVED` | 100 |
@@ -284,7 +286,7 @@ The following BP storage policy is mandatory whenever the target resolution is a
 | 2,000 | `DERIVED` | 1,000 |
 | 500,000 | `MATERIALIZED` | — |
 
-Advertising one of the five mandatory derived targets therefore also requires advertising its stated materialized source. A writer MUST NOT materialize those targets or select another source. A writer MUST NOT derive 500,000 bp. These rules apply to ordinary production and V9 conversion; a conversion that cannot reproduce a mandatory target exactly from its required source MUST fail rather than emit a nonconforming V10 file.
+Advertising one of the seven mandatory derived targets therefore also requires advertising its stated materialized source. A writer MUST NOT materialize those targets or select another source. A writer MUST NOT derive 500,000 bp. These rules apply to ordinary production and V9 conversion; a conversion that cannot reproduce a mandatory target exactly from its required source MUST fail rather than emit a nonconforming V10 file.
 
 The `(unit, resolutionIndex)` pair is the canonical resolution identifier. `binSize` is duplicated in later records for validation; all copies MUST match the header.
 
@@ -839,10 +841,13 @@ Only the redundant contact matrix blocks are omitted.
 
 #### 1.2 Required high-resolution pyramid and standard resolution set
 
-For a file extending from 10 bp through 2.5 Mb, the standard layout is:
+For a file extending from 1 bp through 2.5 Mb, the standard layout is:
 
 | Resolution | Matrix storage | Source |
 |---:|---|---:|
+| 1 bp | **Materialized** | — |
+| 2 bp | Derived | 1 bp |
+| 5 bp | Derived | 1 bp |
 | 10 bp | **Materialized** | — |
 | 20 bp | Derived | 10 bp |
 | 50 bp | Derived | 10 bp |
@@ -861,9 +866,13 @@ For a file extending from 10 bp through 2.5 Mb, the standard layout is:
 | 1 Mb | **Materialized** | — |
 | 2.5 Mb | **Materialized** | — |
 
-The five high-resolution virtual levels below are mandatory whenever advertised because duplicated matrix storage is most expensive there:
+The seven high-resolution virtual levels below are mandatory whenever advertised because duplicated matrix storage is most expensive there:
 
 ```text
+1 bp
+ ├── 2 bp    DERIVED
+ └── 5 bp    DERIVED
+
 10 bp
  ├── 20 bp   DERIVED
  └── 50 bp   DERIVED
@@ -885,6 +894,7 @@ These are kept because they are common interactive and analysis resolutions.
 
 At resolutions finer than 1 kb, the 5× resolutions remain derived:
 
+- **5 bp is derived from 1 bp**
 - **50 bp is derived from 10 bp**
 - **500 bp is derived from 100 bp**
 
@@ -908,7 +918,7 @@ The 25 kb, 250 kb, 500 kb, and 2.5 Mb matrices remain materialized for compatibi
 
 The standard pyramid intentionally omits 20 kb and 200 kb. Although both can be produced exactly as 2× aggregations, their practical value does not justify the additional resolution metadata, normalization and expected-value vectors, reader complexity, and conformance testing. A specialized file MAY advertise them or other additional logical resolutions.
 
-The format permits additional materialized or derived resolutions when a specialized file requires them, but no extension may override the five mandatory derivations or derive 500 kb. The table above defines the standard V10 hierarchy.
+The format permits additional materialized or derived resolutions when a specialized file requires them, but no extension may override the seven mandatory derivations or derive 500 kb. The table above defines the standard V10 hierarchy.
 
 #### 1.3 Derived resolution semantics
 
@@ -1004,7 +1014,7 @@ Score matrices MUST NOT be implicitly aggregated unless the writer explicitly de
 
 A derived resolution MUST point directly to a materialized source resolution.
 
-For the five fixed high-resolution targets, the direct source is not a writer choice: `20 -> 10`, `50 -> 10`, `200 -> 100`, `500 -> 100`, and `2000 -> 1000` BP. The 500,000 bp level is never derived.
+For the seven fixed high-resolution targets, the direct source is not a writer choice: `2 -> 1`, `5 -> 1`, `20 -> 10`, `50 -> 10`, `200 -> 100`, `500 -> 100`, and `2000 -> 1000` BP. The 500,000 bp level is never derived.
 
 For example:
 
@@ -1515,6 +1525,7 @@ Derived resolution families SHOULD be designed so that 2× and 5× aggregation m
 For example:
 
 ```text
+1 bp    -> 2 bp, 5 bp
 10 bp   -> 20 bp, 50 bp
 100 bp  -> 200 bp, 500 bp
 1 kb    -> 2 kb
@@ -1554,7 +1565,7 @@ target resolution
 genomic tile
 ```
 
-This stores already aggregated 20 bp, 50 bp, 200 bp, 500 bp, or 2 kb results.
+This stores already aggregated 2 bp, 5 bp, 20 bp, 50 bp, 200 bp, 500 bp, or 2 kb results.
 
 This is particularly useful when:
 
@@ -1708,7 +1719,7 @@ hic repack --verify-derived-resolutions
 
 If verification fails:
 
-- conversion of a mandatory target (20, 50, 200, 500, or 2,000 bp) fails;
+- conversion of a mandatory target (2, 5, 20, 50, 200, 500, or 2,000 bp) fails;
 - a nonstandard optional derived target may remain materialized, unless strict mode requests failure.
 
 There is no silent approximation.
@@ -1826,6 +1837,8 @@ Test separately:
 Particular attention should be paid to:
 
 ```text
+2 bp   from 1 bp
+5 bp   from 1 bp
 50 bp  from 10 bp
 500 bp from 100 bp
 2 kb   from 1 kb
@@ -1861,6 +1874,7 @@ The required V10 baseline is therefore:
 **Materialized by default:**
 
 ```text
+1 bp
 10 bp
 100 bp
 1 kb
@@ -1878,6 +1892,8 @@ The required V10 baseline is therefore:
 **Derived by exact raw summation:**
 
 ```text
+2 bp
+5 bp
 20 bp
 50 bp
 200 bp
@@ -1946,7 +1962,7 @@ The largest change is the resolution pyramid:
 
 > Store the raw matrix at selected anchor resolutions, while treating intermediate 2× and 5× matrices as exact virtual views over those anchors.
 
-The important working resolutions **5 kb and 50 kb** remain materialized. The established coarse levels **25 kb, 250 kb, 500 kb, 1 Mb, and 2.5 Mb** are also retained physically for compatibility and inexpensive direct access. The five mandatory virtual levels are **20 bp, 50 bp, 200 bp, 500 bp, and 2 kb**. The standard hierarchy does not advertise 20 kb or 200 kb.
+The important working resolutions **5 kb and 50 kb** remain materialized. The established coarse levels **25 kb, 250 kb, 500 kb, 1 Mb, and 2.5 Mb** are also retained physically for compatibility and inexpensive direct access. The seven mandatory virtual levels are **2 bp, 5 bp, 20 bp, 50 bp, 200 bp, 500 bp, and 2 kb**. The standard hierarchy does not advertise 20 kb or 200 kb.
 
 The second major change is to retain V9-compatible rotated cis distance bands and adaptive, increasingly large blocks at fine resolutions, while redesigning the contents of those blocks around what the data actually look like:
 
