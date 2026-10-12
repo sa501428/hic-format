@@ -704,6 +704,15 @@ observedExpected(i,j) = observedOrNormalized(i,j) / effectiveExpected(d)
 
 The raw expected index is used with `NONE`; the normalized expected index matching the requested normalization type is used otherwise. An out-of-range, zero, NaN, or infinite expected value makes O/E unavailable for that cell.
 
+For trans matrices, readers compute a constant expected value from the requested logical resolution's matrix descriptor and full chromosome bin counts:
+
+```text
+transExpected = (sumCountsOrScores / nBins(chr1)) / nBins(chr2)
+observedExpected(i,j) = observedOrNormalized(i,j) / transExpected
+```
+
+This preserves the legacy V9 matrix-average calculation using V10's bin geometry, including partial BP bins and FRAG bin counts. The mean includes absent cells as zero and is independent of the query window and occupied-cell count. Normalization applies only to the observed numerator; the denominator always uses the raw matrix sum. Count sums are converted from unsigned `u64` for arithmetic; score sums are interpreted as `f64`. A zero, NaN, or infinite mean makes O/E unavailable. A trans `expected` matrix query returns this same scalar at present contact cells. No `EVI0` or `NEVI` entry, chromosome scale factor, additional stored scalar, or file-layout change is required. Derived resolutions use their own descriptor sum and target bin counts.
+
 ### K. Derived Resolution Semantics
 
 A derived raw matrix is computed only from its declared materialized source. Let target bin size be `Rt`, source bin size be `Rs`, and `factor = Rt / Rs`.
