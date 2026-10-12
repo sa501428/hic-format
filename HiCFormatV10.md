@@ -1984,3 +1984,15 @@ The resulting V10 format remains an **interactive `.hic` file**, not an archive:
 - O/E-aware;
 - remote-range friendly;
 - substantially less redundant than V9.
+
+
+## Application convention: stored scaled All overview
+
+The optional [scaled All overview convention](ScaledAllOverview.md) uses the
+existing header attribute mechanism and ordinary chromosome/matrix records.
+It does not modify this binary specification or require an All chromosome,
+All-to-real-chromosome matrices, new global resolutions, or additional reserved
+flags. Producers may supply a miniature All chromosome at the finest advertised
+BP resolution, with valid descriptors at every global resolution. Consumers
+interpret its optional attributes for genome-wide display while retaining
+ordinary raw matrix decoding.
