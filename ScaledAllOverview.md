@@ -129,7 +129,12 @@ reinterpreted. `--rebuild-all` migrates them from their real-chromosome data.
 ## Shared constraints and repair
 
 All is identified by its complete case-insensitive name, not index zero.
-Fresh builds append it, preserving real chromosome IDs. All-to-real matrix
+Fresh `pre`, large `write`, and `merge-pairs` builds place it at chromosome
+index 0 and assign real chromosomes indices 1 onward. Staged large-file data
+and pair fragments keep zero-based real IDs until final assembly. Existing-file
+`add-all` repair preserves IDs and appends All when absent; the separate
+[`hic_v10_reindex`](../hictools-c/v10_reindex/README.md) tool moves an existing
+All to index 0 while preserving compressed contact/vector payloads. All-to-real matrix
 pairs are omitted and therefore zero. Real interchromosomal contacts are pixels
 inside All/All. All has no normalization vectors or expected-value scale factors
 and is excluded from normalization. FRAG files give it an empty site list and
